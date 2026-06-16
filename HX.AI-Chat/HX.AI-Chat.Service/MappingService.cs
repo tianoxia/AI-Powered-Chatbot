@@ -1,0 +1,20 @@
+﻿using Microsoft.Extensions.AI;
+using HX.AI_Chat.Common.Enums;
+
+namespace HX.AI_Chat.Service
+{
+    public static class MappingService
+    {
+        public static ChatRole MapToChatRole(ChatRoles role)
+        {
+            return role switch
+            {
+                ChatRoles.System => ChatRole.System,
+                ChatRoles.Assistant => ChatRole.Assistant,
+                ChatRoles.User => ChatRole.User,
+                ChatRoles.Tool => ChatRole.Tool,
+                _ => throw new ArgumentOutOfRangeException(nameof(role), $"Not expected chat role value: {role}"),
+            };
+        }
+    }
+}

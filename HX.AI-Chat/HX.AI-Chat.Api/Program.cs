@@ -1,0 +1,264 @@
+﻿extern alias AzCore;
+extern alias AzId;
+
+using Azure;
+using Azure.AI.DocumentIntelligence;
+//using Azure.AI.OpenAI;
+using OpenAI;
+using Azure.Storage.Blobs;
+using FluentValidation;
+using Hangfire;
+using Hangfire.SqlServer;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.Azure.Cosmos;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.AI;
+using Microsoft.Graph;
+using Microsoft.Identity.Web;
+using OllamaSharp;
+using HX.AI_Chat.Api.Middlewares;
+using HX.AI_Chat.Repository;
+using HX.AI_Chat.Service;
+using HX.AI_Chat.Service.Common.Interface;
+using HX.AI_Chat.Service.Settings;
+using System.ClientModel;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Add services to the container.
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+    .AddMicrosoftIdentityWebApi(options =>
+    {
+        builder.Configuration.Bind("AzureAd", options);
+
+        // Explicitly validate audience to ensure token is for this API
+        options.TokenValidationParameters.ValidateAudience = true;
+        options.TokenValidationParameters.ValidAudiences =
+        [
+            builder.Configuration["AzureAd:ClientId"],
+            $"api://{builder.Configuration["AzureAd:ClientId"]}"
+        ];
+    },
+    options => builder.Configuration.Bind("AzureAd", options))
+    .EnableTokenAcquisitionToCallDownstreamApi(options =>
+    {
+        builder.Configuration.Bind("AzureAd", options);
+    })
+    .AddInMemoryTokenCaches();
+
+builder.Services.AddControllers()
+    .ConfigureApiBehaviorOptions(options =>
+    {
+        options.SuppressModelStateInvalidFilter = true;
+    });
+
+builder.Services.AddHttpContextAccessor();
+
+builder.Services.AddDbContext<AIChatDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection"), sqlOptions =>
+    {
+        sqlOptions.UseCompatibilityLevel(170);
+    })); 
+
+// Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+builder.Services.AddHttpContextAccessor();
+
+// Add CORS
+var corsOrigins = builder.Configuration.GetSection("CorsOrigins").Get<string[]>();
+corsOrigins ??= [];
+builder.Services.AddCors(builder => builder.AddPolicy("AllowSpecificOrigins", policy =>
+{
+    policy.WithOrigins(corsOrigins)
+            .AllowAnyHeader()
+            .AllowAnyMethod()
+            .AllowCredentials()
+            .WithExposedHeaders("Content-Disposition");
+}));
+
+
+// Register Ollama chat client with the same key that services expect
+var ollamaUrl = builder.Configuration.GetValue<string>("OllamaUrl") ?? "http://localhost:11434";
+var ollamaChatModel = builder.Configuration.GetValue<string>("Ollama:DefaultModel") ?? "llama3.2";
+
+// Register OpenAI chat client with the same key that services expect
+//var openAIKey = builder.Configuration.GetValue<string>("OpenAI:ApiKey") ?? string.Empty;
+//var defaultModel = builder.Configuration.GetValue<string>("OpenAI:DefaultModel") ?? "gpt-4o";
+builder.Services.AddKeyedChatClient(
+        "azureaifoundry",
+        sp =>
+        {
+            // Remove trailing slash from URL to avoid double slashes
+            var baseUrl = ollamaUrl.TrimEnd('/');
+            var ollamaClient = new OllamaApiClient(new Uri(baseUrl), ollamaChatModel);
+            return (IChatClient)ollamaClient;
+        }
+    )
+    .UseOpenTelemetry()
+    .UseFunctionInvocation(null, x =>
+    {
+        x.AllowConcurrentInvocation = false;
+        x.IncludeDetailedErrors = true;
+        x.MaximumIterationsPerRequest = 5;
+        x.MaximumConsecutiveErrorsPerRequest = 5;
+    });
+
+
+// Register OpenAI embedding generator
+var embeddingModel = builder.Configuration.GetValue<string>("Ollama:EmbeddingModel") ?? "all-minilm";
+var baseUrlForEmbedding = ollamaUrl.TrimEnd('/');
+IEmbeddingGenerator<string, Embedding<float>> embeddingGenerator =
+    new OllamaApiClient(new Uri(baseUrlForEmbedding), embeddingModel);
+builder.Services.AddEmbeddingGenerator(embeddingGenerator);
+
+// Add Hangfire services
+builder.Services.AddHangfire(configuration => configuration
+    .SetDataCompatibilityLevel(CompatibilityLevel.Version_170)
+    .UseSimpleAssemblyNameTypeSerializer()
+    .UseRecommendedSerializerSettings()
+    .UseSqlServerStorage(builder.Configuration.GetConnectionString("DefaultConnection"), new SqlServerStorageOptions
+    {
+        CommandBatchMaxTimeout = TimeSpan.FromMinutes(5),
+        SlidingInvisibilityTimeout = TimeSpan.FromMinutes(5),
+        QueuePollInterval = TimeSpan.Zero,
+        UseRecommendedIsolationLevel = true,
+        DisableGlobalLocks = true,
+    }));
+
+// Add the processing server as IHostedService
+builder.Services.AddHangfireServer(options =>
+{
+    options.WorkerCount = Environment.ProcessorCount * 2;
+});
+
+// Register IStorageConnection for dependency injection
+builder.Services.AddScoped(provider => JobStorage.Current.GetConnection());
+
+// Add Microsoft Graph Service
+builder.Services.AddSingleton<GraphServiceClient>(sp =>
+{
+    var tenantId = builder.Configuration["AzureAd:TenantId"];
+    var clientId = builder.Configuration["AzureAd:ClientId"];
+    var clientSecret = builder.Configuration["AzureAd:ClientSecret"];
+
+    // Use the type from Azure.Core assembly via Azure.Identity namespace
+    var credential = new AzCore::Azure.Identity.ClientSecretCredential(tenantId, clientId, clientSecret);
+    return new GraphServiceClient(credential);
+});
+
+// Azure Storage
+builder.Services.AddSingleton(x =>
+{
+    var connectionString = builder.Configuration["AzureStorage:ConnectionString"];
+    return new BlobServiceClient(connectionString);
+});
+
+// Azure Document Intelligence 
+//builder.Services.AddSingleton(sp =>
+//{
+//    var config = builder.Configuration.GetSection("DocumentIntelligence");
+//    var endpoint = config["Endpoint"];
+//    var apiKey = config["ApiKey"];
+
+//    var credential = new AzureKeyCredential(apiKey!);
+//    return new DocumentIntelligenceClient(new Uri(endpoint!), credential);
+//});
+
+// Register Azure Cosmos DB
+var cosmosConnectionString = builder.Configuration["CosmosDb:ConnectionString"];
+var cosmosDatabaseId = builder.Configuration["CosmosDb:DatabaseId"];
+var cosmosContainerId = builder.Configuration["CosmosDb:ContainerId"];
+var cosmosClientOptions = new CosmosClientOptions
+{
+    SerializerOptions = new CosmosSerializationOptions
+    {
+        PropertyNamingPolicy = CosmosPropertyNamingPolicy.CamelCase
+    }
+};
+builder.Services.AddSingleton(sp => new CosmosClient(cosmosConnectionString, cosmosClientOptions));
+builder.Services.AddScoped<IAzureCosmosService>(provider =>
+{
+    var cosmosClient = provider.GetRequiredService<CosmosClient>();
+    return new AzureCosmosService(cosmosClient, cosmosDatabaseId!, cosmosContainerId!);
+});
+
+// Register configuration settings
+builder.Services.Configure<List<McpServerSettings>>(builder.Configuration.GetSection("McpServers"));
+
+// Singletons
+builder.Services.AddSingleton<IConversationLockService, ConversationLockService>();
+builder.Services.AddSingleton<ITokenService, TokenService>();
+builder.Services.AddSingleton<IGraphService, GraphService>();
+builder.Services.AddSingleton<IBlobStorageService, BlobStorageService>();
+//builder.Services.AddSingleton<IDocumentIntelligenceService, DocumentIntelligenceService>();
+builder.Services.AddSingleton<IHtmlService, HtmlService>();
+builder.Services.AddSingleton<IPdfService, PdfService>();
+builder.Services.AddSingleton<IWordService, WordService>();
+builder.Services.AddSingleton<IMarkdownService, MarkdownService>();
+builder.Services.AddKeyedSingleton<IFileService, ExcelService>("excel");
+builder.Services.AddKeyedSingleton<IFileService, CommonFileService>("common");
+builder.Services.AddKeyedSingleton<IFileService, WordService>("word");
+
+// Keep other services as Scoped
+builder.Services.AddScoped<IConversationService, ConversationService>();
+builder.Services.AddScoped<IDocumentService, DocumentService>();
+builder.Services.AddScoped<IDocumentToolService, DocumentToolService>();
+builder.Services.AddScoped<IModelService, ModelService>();
+builder.Services.AddScoped<IMcpServerService, McpServerService>();
+builder.Services.AddScoped<IUserService, UserService>();
+
+// Fluent Validators
+builder.Services.AddValidatorsFromAssemblies(AppDomain.CurrentDomain.GetAssemblies());
+
+var app = builder.Build();
+
+// Apply database migrations at startup
+using var scope = app.Services.CreateScope();
+var services = scope.ServiceProvider;
+try
+{
+    var context = services.GetRequiredService<AIChatDbContext>();
+
+    // This will create the database if it doesn't exist and apply all pending migrations
+    context.Database.Migrate();
+
+    app.Logger.LogInformation("Database migrations applied successfully");
+}
+catch (Exception ex)
+{
+    app.Logger.LogError(ex, "An error occurred while migrating the database");
+    throw; // Rethrow to prevent app startup if migration fails
+}
+
+// Apply cosmos DB migrations or setup if needed
+var cosmosClient = services.GetRequiredService<CosmosClient>();
+var database = await cosmosClient.CreateDatabaseIfNotExistsAsync(cosmosDatabaseId);
+await database.Database.CreateContainerIfNotExistsAsync(cosmosContainerId, "/userId");
+
+// Configure the HTTP request pipeline.
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+// Add Hangfire Dashboard
+app.UseHangfireDashboard("/hangfire", new DashboardOptions
+{
+    //Authorization = new[] { new HangfireAuthorizationFilter() }
+});
+
+app.UseMiddleware<ExceptionHandlerMiddleware>();
+
+app.UseHttpsRedirection();
+
+app.UseCors("AllowSpecificOrigins");
+
+app.UseAuthentication();
+
+app.UseAuthorization();
+
+app.MapControllers();
+
+app.Run();
