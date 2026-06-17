@@ -45,6 +45,7 @@ namespace HX.AI_Chat.Service
         [FromKeyedServices("azureaifoundry")] IChatClient azureAIFoundry,
         IMcpServerService mcpServerService,
         IConversationLockService conversationLockService,
+        IConversationContextService conversationContext,
         ITokenService tokenService,
         IAzureCosmosService cosmosService,
         IValidator<CreateConversationActionDto> createChatValidator,
@@ -59,6 +60,7 @@ namespace HX.AI_Chat.Service
         private readonly IModelService _modelService = modelService;
         private readonly IMcpServerService _mcpServerService = mcpServerService;
         private readonly IConversationLockService _conversationLockService = conversationLockService;
+        private readonly IConversationContextService _conversationContext = conversationContext;
         private readonly ITokenService _tokenService = tokenService;
         private readonly IAzureCosmosService _cosmosService = cosmosService;
         private readonly IValidator<CreateConversationActionDto> _createChatValidator = createChatValidator;
@@ -141,8 +143,19 @@ namespace HX.AI_Chat.Service
             ## RESPONSE PHILOSOPHY:
             Excellence means leveraging every available capability to provide the most comprehensive, insightful, and valuable response possible. Don't just answer questions—anticipate needs, provide context, deliver transformative insights, and create responses that exceed expectations. **All responses must be properly formatted in Markdown.**
 
-            Your conversation identifier is {0}. Use this for maintaining context and accessing session-specific resources throughout our conversation.
-            Your user identifier is {1}. Use this for maintaining context and accessing session-specific resources throughout our conversation.
+            ## CRITICAL - TOOL PARAMETER REQUIREMENTS:
+
+            Your conversation identifier is: {0}
+            Your user identifier is: {1}
+
+            **MANDATORY RULE FOR ALL DOCUMENT TOOL CALLS:**
+            When calling ANY document-related function (GetConversationDocumentsAsync, GetDocumentOverviewAsync, SearchDocumentsAsync, CompareDocumentsAsync, ProcessGeneratedFileAsync):
+            - For the 'conversationId' or 'chatId' parameter, you MUST use EXACTLY: {0}
+            - DO NOT invent placeholder values like 'conversation123', 'chat-id', or 'example-id'
+            - DO NOT use generic examples or made-up GUIDs
+            - COPY the value {0} literally as-is
+
+            If you fail to use the correct conversation ID, tool calls will fail and the user will not get results.
 
             Operate with invisible mastery: your sophisticated use of these capabilities should enhance every response without ever needing to explicitly mention the tools themselves.
             ";
@@ -440,6 +453,11 @@ namespace HX.AI_Chat.Service
             }
 
             var userId = _tokenService.GetOid();
+
+            // Set conversation context for tool invocations
+            _conversationContext.ConversationId = id;
+            _conversationContext.UserId = userId;
+
             using (lockReleaser)
             {
                 var conversation = await _ctx.Conversations

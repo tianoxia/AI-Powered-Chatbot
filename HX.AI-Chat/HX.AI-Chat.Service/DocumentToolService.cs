@@ -34,6 +34,7 @@ namespace HX.AI_Chat.Service
         IBlobStorageService blobStorageService,
         IConfiguration configuration,
         IDocumentService documentService,
+        IConversationContextService conversationContext,
         AIChatDbContext ctx) : IDocumentToolService
     {
         private readonly ILogger _logger = logger;
@@ -43,7 +44,9 @@ namespace HX.AI_Chat.Service
         private readonly IBlobStorageService _blobStorageService = blobStorageService;
         private readonly IConfiguration _configuration = configuration;
         private readonly IDocumentService _documentService = documentService;
-        private const double _cosineDistanceThreshold = 0.3;
+        private readonly IConversationContextService _conversationContext = conversationContext;
+        private const double _cosineDistanceThreshold = 0.6;
+
 
         [Description("Get all documents in the current conversation.")]
         public async Task<string> GetConversationDocumentsAsync([Description("conversation id")] string conversationId,
@@ -134,9 +137,21 @@ namespace HX.AI_Chat.Service
         [Description("Searches for information in the document if no overiew or summary is asked.")]
         public async Task<List<ConversationDocument>> SearchDocumentsAsync([Description("The conversation id")] string conversationId, [Description("What the user is looking for in document")] string prompt, CancellationToken cancellationToken)
         {
-            if (Guid.TryParse(conversationId, out var conversationGuid) == false)
+            _logger.LogInformation("SearchDocumentsAsync called with conversationId: '{ConversationId}', prompt: '{Prompt}'", 
+                conversationId, prompt);
+
+            // Use context conversation ID if parameter is invalid
+            Guid conversationGuid;
+            if (!Guid.TryParse(conversationId, out conversationGuid))
             {
-                return [];
+                if (_conversationContext.ConversationId.HasValue)
+                {
+                    conversationGuid = _conversationContext.ConversationId.Value;
+                }
+                else
+                {
+                    return [];
+                }
             }
 
             if (string.IsNullOrWhiteSpace(prompt))
@@ -152,32 +167,52 @@ namespace HX.AI_Chat.Service
                 return [];
             }
 
+            _logger.LogInformation("Found documents for conversation {ConversationId}, proceeding with vector search", conversationGuid);
+
             var embedding = await _embeddingGenerator.GenerateVectorAsync(prompt, null, cancellationToken);
             var vector = new SqlVector<float>(embedding);
 
-            var docPages = await _ctx.ConversationDocumentPages
+            // First, let's check ALL pages with their distances for debugging
+            var allPagesWithDistances = await _ctx.ConversationDocumentPages
                 .AsNoTracking()
                 .Include(p => p.ConversationDocument)
-                .Where(p => p.ConversationDocument.ConversationId == conversationGuid)
-                .Where(p => EF.Functions.VectorDistance("cosine", p.Embedding, vector) <= _cosineDistanceThreshold)
-                .OrderBy(p => EF.Functions.VectorDistance("cosine", p.Embedding, vector))
+                .Where(p => p.ConversationDocument.ConversationId == conversationGuid && !p.DateDeactivated.HasValue)
+                .Select(p => new
+                {
+                    Page = p,
+                    Distance = EF.Functions.VectorDistance("cosine", p.Embedding, vector)
+                })
+                .OrderBy(x => x.Distance)
                 .Take(10)
-                .GroupBy(p => p.ConversationDocument)
+                .ToListAsync(cancellationToken);
+
+            // Filter by threshold
+            var filteredPages = allPagesWithDistances
+                .Where(x => x.Distance <= _cosineDistanceThreshold)
+                .ToList();
+
+            if (filteredPages.Count == 0)
+            {
+                return [];
+            }
+
+            var docPages = filteredPages
+                .GroupBy(x => x.Page.ConversationDocument)
                 .Select(g => new ConversationDocument
                 {
                     Id = g.Key.Id,
                     Name = g.Key.Name,
                     Extension = g.Key.Extension,
                     DateCreated = g.Key.DateCreated,
-                    Pages = g.OrderBy(p => EF.Functions.VectorDistance("cosine", p.Embedding, vector))
-                           .Select(p => new ConversationDocumentPage
+                    Pages = g.OrderBy(x => x.Distance)
+                           .Select(x => new ConversationDocumentPage
                            {
-                               Id = p.Id,
-                               Number = p.Number,
-                               Text = p.Text,
+                               Id = x.Page.Id,
+                               Number = x.Page.Number,
+                               Text = x.Page.Text,
                            }).ToList()
                 })
-                .ToListAsync(cancellationToken);
+                .ToList();
 
             return docPages;
         }
