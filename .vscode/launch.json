@@ -6,7 +6,7 @@
       "type": "coreclr",
       "request": "launch",
       "preLaunchTask": "build-api",
-      "program": "${workspaceFolder}/HX.AI-Chat/RR.AI-Chat.Api/bin/Debug/net10.0/HX.AI-Chat.Api.dll",
+      "program": "${workspaceFolder}/HX.AI-Chat/HX.AI-Chat.Api/bin/Debug/net10.0/HX.AI-Chat.Api.dll",
       "args": [],
       "cwd": "${workspaceFolder}/HX.AI-Chat/HX.AI-Chat.Api",
       "stopAtEntry": false,
